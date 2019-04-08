@@ -186,7 +186,7 @@ class DeepFM(BaseEstimator, TransformerMixin):
         ###----first order------######
         self.y_first_order = Embedding(self.feature_size, 1, name='feature_bias', 
                 embeddings_regularizer=l2_reg(self.l2))(self.feat_index) #None*F*1
-        self.y_first_order = Multiply()([self.y_first_order, self.feat_value]) #None*F*1
+        self.y_first_order = Multiply()([self.y_first_order, feat_value]) #None*F*1
         self.y_first_order = MySumLayer(axis=1)(self.y_first_order) # None*1
         self.y_first_order = Dropout(self.dropout_keep_fm[0], seed=self.seed)(self.y_first_order)
     
@@ -281,20 +281,22 @@ class DeepFM(BaseEstimator, TransformerMixin):
         ]
 
         total = getFileLineCount(trainPath)
-        print('total train samples: {}'.format(total))
+        totalValid = getFileLineCount(validPath)
+        print('total train samples: {}, total valid samples: {}'.format(total, totalValid))
 
-        validation_data = self.read_libsvm_data(validPath) 
+        #validation_data = self.read_libsvm_data(validPath) 
         his = self.model.fit_generator(self.generate_data_on_libsvm(trainPath), 
-                steps_per_epoch=total/self.batch_size, epochs=self.epoch, 
-                verbose=self.verbose, validation_data=validation_data, callbacks=cb)
+                steps_per_epoch=total/self.batch_size, epochs=self.epoch, initial_epoch=0, 
+                verbose=self.verbose, callbacks=cb,
+                validation_data=self.generate_data_on_libsvm(validPath), validation_steps=totalValid/self.batch_size)
 
 
 
 if __name__ == '__main__':
 
-    trainPath = './data/train.libsvm'
-    validPath = './data/valid.libsvm'
-    indexPath = './data/xgb_20190402_feature_mapping.csv'
+    trainPath = '../data/train_20190403.libsvm'
+    validPath = '../data/valid_20190403.libsvm'
+    indexPath = '../data/xgb_20190403_feature_mapping.csv'
 
     dfm_params = {
         'feature_size': 12026792,
@@ -315,21 +317,26 @@ if __name__ == '__main__':
         'eval_metric': 'auc',
         'l2': 0.01,
         'l2_fm': 0.01,
-        'log_dir': './keras_output',
-        'bestModelPath': './keras_output/keras.model',
+        'log_dir': '../keras_output',
+        'bestModelPath': '../keras_output/keras.model',
         'greater_is_better': True
     }
 
-    #index_dfs = pd.read_csv(indexPath, index_col=False, sep='\t', chunksize=1000)
-    #feature_size = 0
-    #for index_df in index_dfs:
-    #    # print(index_df.head())
-    #    tmp = max(index_df['feat_id'])
-    #    feature_size = tmp if feature_size < tmp else feature_size
-    #feature_size += 1
-    #dfm_params['feature_size'] = feature_size
+    index_dfs = pd.read_csv(indexPath, index_col=False, sep='\t', chunksize=1000)
+    feature_size = 0
+    for index_df in index_dfs:
+        # print(index_df.head())
+        tmp = max(index_df['feat_id'])
+        feature_size = tmp if feature_size < tmp else feature_size
+    feature_size += 1
+    dfm_params['feature_size'] = feature_size
 
-    print('feature_size: {}'.format(dfm_params['feature_size']))
+    with open(trainPath, 'r') as f:
+        line = f.readline()
+        field_size = len(line.split(' ')) - 1
+        dfm_params['field_size'] = field_size
+
+    print('feature_size: {}, field_size: {}'.format(dfm_params['feature_size'], dfm_params['field_size']))
 
     dfm = DeepFM(**dfm_params)
     dfm.fit_on_libsvm(trainPath, validPath)
