@@ -277,7 +277,7 @@ class DeepFM(BaseEstimator, TransformerMixin):
           keras.callbacks.EarlyStopping(monitor=monitor, patience=5, verbose=self.verbose, mode=mode),
           keras.callbacks.ModelCheckpoint(self.bestModelPath, monitor=monitor, verbose=self.verbose, 
                         save_best_only=True, save_weights_only=False, mode=mode, period=1),
-          keras.callbacks.TensorBoard(log_dir=self.log_dir, histogram_freq=1),
+          keras.callbacks.TensorBoard(log_dir=self.log_dir), # histogram_freq=1), if validation_data is generator, can not use histogram
         ]
 
         total = getFileLineCount(trainPath)
