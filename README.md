@@ -1,6 +1,9 @@
 # keras-DeepFM  
 Implementation of DeepFM using keras. And train on libsvm format file  
   
+
+  
+实验平台：阿里云机器学习平台PAI 1.8
   
 deepfm_esitmator.py  
 自定义estimator来实现分布式的训练，也可以单机，成功  
