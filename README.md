@@ -2,9 +2,12 @@
 Implementation of DeepFM using keras. And train on libsvm format file  
   
   
-deepfm_esitmator.py  自定义estimator来实现分布式的训练，也可以单机，成功  
+deepfm_esitmator.py  
+自定义estimator来实现分布式的训练，也可以单机，成功  
   
-tf_keras_estimator_deepFM.py  先定义tf.keras.Model，然后调用 tf.keras.estimator.model_to_estimator 转为 estimator，失败  
+tf_keras_estimator_deepFM.py  
+先定义tf.keras.Model，然后调用 tf.keras.estimator.model_to_estimator 转为 estimator，失败  
+  
 报错如下：  
 ```
   File "/usr/lib/python2.7/site-packages/tensorflow/python/training/session_manager.py", line 519, in _try_run_local_init_op
