@@ -21,6 +21,8 @@ from tensorflow.contrib.distribute.python.mirrored_strategy import MirroredStrat
 
 from tensorflow.python.lib.io import file_io
 
+from tensorflow.contrib.data.python.ops.interleave_ops import parallel_interleave
+
 import os
 import time
 import sys
@@ -139,14 +141,11 @@ class DeepFMEstimator:
 
     def deepfm_model_fn(self, features, labels, mode):
 
-        self.feat_index = features['feat_index']
-        self.feat_value = features['feat_value']
+        feat_index = features['feat_index']
+        feat_value = features['feat_value']
 
-        self.feat_index = tf.reshape(self.feat_index, [-1, self.field_size])
-        self.feat_value = tf.reshape(self.feat_value, [-1, self.field_size])
-
-        print(self.feat_index.shape, self.feat_index.dtype)
-        print(self.feat_value.shape, self.feat_value.dtype)
+        feat_index = tf.reshape(feat_index, [-1, self.field_size])
+        feat_value = tf.reshape(feat_value, [-1, self.field_size])
 
         np.random.seed(self.seed)
         tf.set_random_seed(self.seed)
@@ -154,54 +153,59 @@ class DeepFMEstimator:
         # self.feat_index = Input(shape=(self.field_size,), name='feat_index', dtype=tf.int64)  # None*F
         # self.feat_value = Input(shape=(self.field_size,), name='feat_value', dtype=tf.float32)  # None*F
 
-        self.embeddings = Embedding(self.feature_size, self.k, name='feature_embeddings',
-                                    embeddings_regularizer=l2_reg(self.l2_fm))(self.feat_index)  # None*F*k
-        feat_value = Reshape((self.field_size, 1))(self.feat_value)
-        self.embeddings = Multiply()([self.embeddings, feat_value])  # None*F*8
+        embeddings = Embedding(self.feature_size, self.k, name='feature_embeddings',
+                               embeddings_initializer='truncated_normal',
+                               embeddings_regularizer=l2_reg(self.l2_fm))(feat_index)  # None*F*k
+        # embeddings = tf.keras.layers.BatchNormalization()(embeddings)
+        tmp_feat_value = Reshape((self.field_size, 1))(feat_value)
+        embeddings = Multiply()([embeddings, tmp_feat_value])  # None*F*8
 
         ###----first order------######
-        self.y_first_order = Embedding(self.feature_size, 1, name='feature_bias',
-                                       embeddings_regularizer=l2_reg(self.l2))(self.feat_index)  # None*F*1
-        self.y_first_order = Multiply()([self.y_first_order, feat_value])  # None*F*1
-        self.y_first_order = MySumLayer(axis=1)(self.y_first_order)  # None*1
-        self.y_first_order = Dropout(self.dropout_keep_fm[0], seed=self.seed)(self.y_first_order)  # None*1
+        y_first_order = Embedding(self.feature_size, 1, name='feature_bias',
+                                  embeddings_initializer='truncated_normal',
+                                  embeddings_regularizer=l2_reg(self.l2))(feat_index)  # None*F*1
+        y_first_order = Multiply()([y_first_order, tmp_feat_value])  # None*F*1
+        y_first_order = MySumLayer(axis=1)(y_first_order)  # None*1
+        # self.y_first_order = Dropout(self.dropout_keep_fm[0], seed=self.seed)(self.y_first_order)  # None*1
 
         ###------second order term-------###
         # sum_square part
-        self.summed_feature_emb = MySumLayer(axis=1)(self.embeddings)  # None*k
-        self.summed_feature_emb_squred = Multiply()([self.summed_feature_emb, self.summed_feature_emb])  # None*k
+        summed_feature_emb = MySumLayer(axis=1)(embeddings)  # None*k
+        summed_feature_emb_squred = Multiply()([summed_feature_emb, summed_feature_emb])  # None*k
         # square_sum part
-        self.squared_feature_emb = Multiply()([self.embeddings, self.embeddings])
-        self.squared_sum_feature_emb = MySumLayer(axis=1)(self.squared_feature_emb)  # None*k
+        squared_feature_emb = Multiply()([embeddings, embeddings])
+        squared_sum_feature_emb = MySumLayer(axis=1)(squared_feature_emb)  # None*k
 
         # second order
-        self.y_second_order = Lambda(lambda x: x[0] - x[1])(
-            [self.summed_feature_emb_squred, self.squared_sum_feature_emb])  # None*k
-        self.y_second_order = MySumLayer(axis=1)(self.y_second_order)  # None*1
-        self.y_second_order = Lambda(lambda x: x * 0.5)(self.y_second_order)  # None*k
+        y_second_order = Lambda(lambda x: x[0] - x[1])(
+            [summed_feature_emb_squred, squared_sum_feature_emb])  # None*k
+        y_second_order = MySumLayer(axis=1)(y_second_order)  # None*1
+        y_second_order = Lambda(lambda x: x * 0.5)(y_second_order)  # None*k
 
         ##deep
-        self.y_deep = Reshape((self.field_size * self.k,))(self.embeddings)
+        y_deep = Reshape((self.field_size * self.k,))(embeddings)
 
         for i in range(0, len(self.deep_layers)):
-            self.y_deep = Dense(self.deep_layers[i], activation='relu')(self.y_deep)
-            self.y_deep = Dropout(self.dropout_keep_deep[i], seed=self.seed)(self.y_deep)  # None*32
+            y_deep = Dense(self.deep_layers[i], activation='relu')(y_deep)
+            y_deep = Dropout(self.dropout_keep_deep[i], seed=self.seed)(y_deep)  # None*32
 
         # deepFM
         if self.use_fm and self.use_deep:
-            self.concat_y = Concatenate()([self.y_first_order, self.y_second_order, self.y_deep])
+            concat_y = Concatenate()([y_first_order, y_second_order, y_deep])
         elif self.use_fm:
-            self.concat_y = Concatenate()([self.y_first_order, self.y_second_order])
+            concat_y = Concatenate()([y_first_order, y_second_order])
         elif self.use_deep:
-            self.concat_y = self.y_deep
+            concat_y = y_deep
 
-        self.y = Dense(1, activation='sigmoid', name='output')(self.concat_y)  # None*1
+        logits = Dense(1, name='output')(concat_y)  # None*1
+        y = tf.sigmoid(logits)
 
         if mode == tf.estimator.ModeKeys.PREDICT:
             spec = tf.estimator.EstimatorSpec(mode=mode,
-                                              predictions=self.y)
+                                              predictions=y)
         else:
-            cross_entropy = tf.losses.sigmoid_cross_entropy(labels, self.y)
+
+            cross_entropy = tf.losses.sigmoid_cross_entropy(labels, logits=logits)
 
             # Reduce the cross-entropy batch-tensor to a single number
             # which can be used in optimization of the neural network.
@@ -221,11 +225,11 @@ class DeepFMEstimator:
             # in this case the classification accuracy.
             if self.eval_metric == 'auc':
                 metrics = {
-                    'auc': tf.metrics.auc(labels, self.y)
+                    'auc': tf.metrics.auc(labels, y)
                 }
             else:
                 metrics = {
-                    "accuracy": tf.metrics.accuracy(labels, self.y)
+                    "accuracy": tf.metrics.accuracy(labels, y)
                 }
 
             # Wrap all of this in an EstimatorSpec.
@@ -282,7 +286,12 @@ def get_oss_table_line_count(table_name):
 class OssDataFeeder:
 
     def __init__(self, table_name):
-        self.filenames = list_odps_table_oss_files(table_name)
+        filenames = list_odps_table_oss_files(table_name)
+        filenames.sort()
+        self.filenames = []
+        for i in range(len(filenames)):
+            if FLAGS.task_index == i % FLAGS.worker_num:
+                self.filenames.append(filenames[i])
 
     def line2xy(self, line):
         line = line.split(' ')
@@ -292,6 +301,7 @@ class OssDataFeeder:
         return Xi, Xv, [y]
 
     def file_line_generator(self):
+        print('train data files:', self.filenames)
         for fpath in self.filenames:
             f = file_io.FileIO(fpath, mode="r")
             line = f.readline()
@@ -313,9 +323,54 @@ class OssDataFeeder:
                                                  (tf.TensorShape([None]), tf.TensorShape([None]), tf.TensorShape([1]))
                                                  )
         dataset = dataset.map(lambda xi, xv, y: ({'feat_index': xi, 'feat_value': xv}, y))
-        if num_epochs is not None and num_epochs >= 0:
+        if num_epochs is not None and num_epochs >= 1:
             dataset = dataset.repeat(num_epochs)
         dataset = dataset.batch(batch_size)
+        return dataset
+
+    def decode_csv_fn(self, line):
+        columns = tf.string_split([line], ' ')
+        labels = tf.string_to_number(columns.values[0], out_type=tf.int32)
+        labels = tf.reshape(labels, [-1])
+
+        splits = tf.string_split(columns.values[1:], ':')
+
+        id_vals = tf.reshape(splits.values, splits.dense_shape)
+        feat_ids, feat_vals = tf.split(id_vals, num_or_size_splits=2, axis=1)
+
+        feat_ids = tf.string_to_number(feat_ids, out_type=tf.int64)
+        feat_vals = tf.string_to_number(feat_vals, out_type=tf.float32)
+
+        feat_ids = tf.reshape(feat_ids, [-1])
+        feat_vals = tf.reshape(feat_vals, [-1])
+
+        #         indices = np.array(range(0,3))
+        #         indices = indices.reshape(3,1)
+        #         sparse_feature = tf.SparseTensor(indices, tf.reshape(feat_vals,[-1]), [3])
+        #         dense_feature = tf.sparse.to_dense(sparse_feature)
+
+        return {'feat_index': feat_ids, 'feat_value': feat_vals}, labels
+
+    def create_dataset_from_file(self, batch_size, num_epochs=None):
+        dataset_files = tf.data.Dataset.from_tensor_slices(self.filenames)
+        dataset = dataset_files.interleave(
+            lambda x:
+                tf.data.TextLineDataset(x).map(self.decode_csv_fn,
+                                               num_parallel_calls=8),  # 并行的进行map
+            cycle_length=4,  # 控制并发读取数量
+            block_length=1)
+
+        # dataset_files = tf.data.Dataset.list_files(self.filenames)
+        # dataset = dataset_files.apply(parallel_interleave(
+        #     lambda x:
+        #         tf.data.TextLineDataset(x).map(self.decode_csv_fn,
+        #                                        num_parallel_calls=8),  # 并行的进行map
+        #     cycle_length=4,  # 控制并发读取数量
+        #     block_length=1))
+
+        dataset = dataset.repeat(num_epochs)  # 重复次数
+        dataset = dataset.batch(batch_size)
+        dataset = dataset.prefetch(1)  # 实现流水线
         return dataset
 
     def generate_batch(self, batch_size, num_epochs=None):
@@ -325,106 +380,6 @@ class OssDataFeeder:
         out_batch = iterator.get_next()
 
         return out_batch
-
-
-def main(_):
-    print(FLAGS)
-
-    if len(FLAGS.ps_hosts) > 1 and len(FLAGS.worker_hosts) > 1:
-        set_tfconfig_environ()
-
-    dfm_params = {
-        'feature_size': 12026792,
-        'field_size': 79,
-        'k': 8,
-        'use_fm': True,
-        'use_deep': True,
-        'dropout_keep_fm': [0.0, 0.0],
-        'deep_layers': [32, 32, 1],
-        'dropout_keep_deep': [0.5, 0.5, 0.5],
-        'epoch': FLAGS.max_steps,
-        'batch_size': FLAGS.task_batch_size * FLAGS.worker_num,
-        'learning_rate': FLAGS.learning_rate,
-        'optimizer_type': 'adam',
-        'verbose': 1,
-        'random_seed': 1234,
-        'loss_type': 'logloss',
-        'eval_metric': 'auc',
-        'l2': 0.01,
-        'l2_fm': 0.01,
-        'log_dir': FLAGS.checkpointDir,
-        'bestModelPath': os.path.join(FLAGS.checkpointDir, 'keras.model'),
-        'greater_is_better': True
-    }
-
-    feature_table = 'oss_ml_video_recommend_feature_mapping'
-    feature_table_gen = oss_odps_table_generator(feature_table)
-
-    max_feat_id = 0
-    try:
-        while True:
-            line = feature_table_gen.next()
-            col_arr = line.split(',')
-            field_name = col_arr[0]
-            feat_value = ','.join(col_arr[1:-2])
-            feat_id = int(col_arr[-2])
-            field_id = int(col_arr[-1])
-            max_feat_id = feat_id if feat_id > max_feat_id else max_feat_id
-    except StopIteration as si:
-        print("feature_table_gen StopIteration")
-
-    train_table = 'oss_ml_video_recommend_train_data_for_like'
-    test_table = 'oss_ml_video_recommend_test_data_for_like'
-    train_table_gen = oss_odps_table_generator(train_table)
-    line = train_table_gen.next()
-    field_size = len(line.split(' ')) - 1
-
-    dfm_params['feature_size'] = max_feat_id + 1
-    dfm_params['field_size'] = field_size
-
-    print('feature_size: {}, field_size: {}'.format(dfm_params['feature_size'], dfm_params['field_size']))
-
-    dfm = DeepFMEstimator(**dfm_params)
-    # dfm.fit_on_libsvm(train_table, test_table)
-
-    # devices = ['/device:CPU:0']
-    # strategy = MirroredStrategy()
-
-    config = tf.estimator.RunConfig(model_dir=FLAGS.checkpointDir,
-                                    save_checkpoints_steps=FLAGS.save_checkpoints_steps,
-                                    train_distribute=None)
-
-    estimator = tf.estimator.Estimator(model_fn=dfm.deepfm_model_fn,
-                                       model_dir=FLAGS.checkpointDir,
-                                       config=config)
-
-    # print(dfm.model.input_names)
-    print(tf.VERSION)
-
-    total = 16333644
-    epoch_steps = total / dfm_params['batch_size']
-
-    train_input_fn = lambda: OssDataFeeder(train_table).create_dataset(dfm_params['batch_size'], num_epochs=10)
-    test_input_fn = lambda: OssDataFeeder(test_table).create_dataset(10000, num_epochs=None)
-
-    train_spec = tf.estimator.TrainSpec(input_fn=train_input_fn, max_steps=10 * epoch_steps)
-    eval_spec = tf.estimator.EvalSpec(input_fn=test_input_fn, steps=200)
-
-    # estimator.train(train_input_fn, steps=100)
-    tf.estimator.train_and_evaluate(estimator, train_spec, eval_spec)
-
-    # Evaluate accuracy.
-    results = estimator.evaluate(input_fn=test_input_fn)
-    for key in sorted(results):
-        print('%s: %s' % (key, results[key]))
-
-    print("after evaluate")
-
-    # if FLAGS.job_name == "worker" and FLAGS.task_index == 0:
-    #     print("exporting model ...")
-    #     serving_input_receiver_fn = tf.estimator.export.build_parsing_serving_input_receiver_fn(feature_spec)
-    #     estimator.export_savedmodel(FLAGS.output_model, serving_input_receiver_fn)
-    # print("quit main")
 
 
 def set_tfconfig_environ():
@@ -495,11 +450,119 @@ def parse_argument():
     os.environ["TF_CLUSTER_DEF"] = json.dumps(cluster)
 
 
+def main(_):
+    print(FLAGS)
+
+    if len(FLAGS.ps_hosts) > 1 and len(FLAGS.worker_hosts) > 1:
+        set_tfconfig_environ()
+
+    dfm_params = {
+        'feature_size': 12026792,
+        'field_size': 79,
+        'k': 8,
+        'use_fm': True,
+        'use_deep': False,
+        'dropout_keep_fm': [0.0, 0.0],
+        'deep_layers': [32, 32, 1],
+        'dropout_keep_deep': [0.5, 0.5, 0.5],
+        'epoch': FLAGS.num_epochs,
+        'batch_size': FLAGS.task_batch_size * FLAGS.worker_num,
+        'learning_rate': FLAGS.learning_rate,
+        'optimizer_type': 'adam',
+        'verbose': 1,
+        'random_seed': 1234,
+        'loss_type': 'logloss',
+        'eval_metric': 'auc',
+        'l2': 0.01,
+        'l2_fm': 0.01,
+        'log_dir': FLAGS.checkpointDir,
+        'bestModelPath': os.path.join(FLAGS.checkpointDir, 'keras.model'),
+        'greater_is_better': True
+    }
+
+    feature_table = 'oss_ml_video_recommend_feature_mapping'
+    feature_table_gen = oss_odps_table_generator(feature_table)
+
+    max_feat_id = 0
+    try:
+        while True:
+            line = feature_table_gen.next()
+            col_arr = line.split(',')
+            field_name = col_arr[0]
+            feat_value = ','.join(col_arr[1:-2])
+            feat_id = int(col_arr[-2])
+            field_id = int(col_arr[-1])
+            max_feat_id = feat_id if feat_id > max_feat_id else max_feat_id
+    except StopIteration as si:
+        print("feature_table_gen StopIteration")
+
+    train_table = 'oss_ml_video_recommend_train_data_for_like'
+    test_table = 'oss_ml_video_recommend_test_data_for_like'
+    train_table_gen = oss_odps_table_generator(train_table)
+    line = train_table_gen.next()
+    field_size = len(line.split(' ')) - 1
+
+    dfm_params['feature_size'] = max_feat_id + 1
+    dfm_params['field_size'] = field_size
+
+    print('feature_size: {}, field_size: {}'.format(dfm_params['feature_size'], dfm_params['field_size']))
+
+    dfm = DeepFMEstimator(**dfm_params)
+    # dfm.fit_on_libsvm(train_table, test_table)
+
+    # devices = ['/device:CPU:0']
+    # strategy = MirroredStrategy()
+    # print(dfm.model.input_names)
+
+    print(tf.VERSION)
+
+    total = 2471795  # 16333644
+    epoch_steps = total // dfm_params['batch_size']
+    save_checkpoints_steps = epoch_steps // 4
+    max_steps = FLAGS.num_epochs * epoch_steps
+
+    print('total: %d, epoch_steps: %d, save_checkpoints_steps: %d, max_steps: %d'
+          % (total, epoch_steps, save_checkpoints_steps, max_steps))
+
+    config = tf.estimator.RunConfig(model_dir=FLAGS.checkpointDir,
+                                    tf_random_seed=123,
+                                    save_summary_steps=save_checkpoints_steps,
+                                    save_checkpoints_steps=save_checkpoints_steps,
+                                    train_distribute=None)
+
+    estimator = tf.estimator.Estimator(model_fn=dfm.deepfm_model_fn,
+                                       model_dir=FLAGS.checkpointDir,
+                                       config=config)
+
+    train_input_fn = lambda: OssDataFeeder(train_table).create_dataset(dfm_params['batch_size'],
+                                                                       num_epochs=FLAGS.num_epochs)
+    test_input_fn = lambda: OssDataFeeder(test_table).create_dataset(dfm_params['batch_size'], num_epochs=None)
+
+    train_spec = tf.estimator.TrainSpec(input_fn=train_input_fn, max_steps=max_steps)
+    eval_spec = tf.estimator.EvalSpec(input_fn=test_input_fn, steps=None)
+
+    # estimator.train(train_input_fn, steps=100)
+    tf.estimator.train_and_evaluate(estimator, train_spec, eval_spec)
+
+    # Evaluate accuracy.
+    results = estimator.evaluate(input_fn=test_input_fn)
+    for key in sorted(results):
+        print('%s: %s' % (key, results[key]))
+
+    print("after evaluate")
+
+    # if FLAGS.job_name == "worker" and FLAGS.task_index == 0:
+    #     print("exporting model ...")
+    #     serving_input_receiver_fn = tf.estimator.export.build_parsing_serving_input_receiver_fn(feature_spec)
+    #     estimator.export_savedmodel(FLAGS.output_model, serving_input_receiver_fn)
+    # print("quit main")
+
+
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
-    parser.add_argument('--max_steps', type=int, default=1000,
+    parser.add_argument('--num_epochs', type=int, default=10,
                         help='Number of steps to run trainer.')
-    parser.add_argument('--learning_rate', type=float, default=0.1,
+    parser.add_argument('--learning_rate', type=float, default=0.01,
                         help='Initial learning rate')
     parser.add_argument('--dropout', type=float, default=0.9,
                         help='Keep probability for training dropout.')
@@ -528,7 +591,7 @@ if __name__ == '__main__':
     parser.add_argument("--task_index", type=int, default=0, help="Index of task within the job")
     parser.add_argument('--worker_num', type=int, default=1,
                         help='Number of train worker.')
-    parser.add_argument('--save_checkpoints_steps', type=int, default=200,
+    parser.add_argument('--save_checkpoints_steps', type=int, default=100,
                         help='Save checkpoints every this many steps')
 
     FLAGS, unparsed = parser.parse_known_args()
