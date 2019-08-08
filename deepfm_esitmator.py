@@ -382,7 +382,7 @@ class OssDataFeeder:
         return out_batch
 
 
-def set_tfconfig_environ():
+def set_tfconfig_environ(choose_ps_as_evaluate=False):
     parse_argument()
 
     if "TF_CLUSTER_DEF" in os.environ:
@@ -394,9 +394,20 @@ def set_tfconfig_environ():
         worker_num = len(cluster["worker"])
         FLAGS.worker_num = worker_num
         if task_type == "ps":
-            tf_config["task"] = {"index": task_index, "type": task_type}
-            FLAGS.job_name = "ps"
-            FLAGS.task_index = task_index
+            # 把第一个ps转为evaluator
+            if len(cluster["ps"]) >= 2 and choose_ps_as_evaluate:
+                if task_index == 0:
+                    tf_config["task"] = {"index": 0, "type": "evaluator"}
+                    FLAGS.job_name = "evaluator"
+                    FLAGS.task_index = 0
+                else:
+                    tf_config["task"] = {"index": task_index - 1, "type": task_type}
+                    FLAGS.job_name = "ps"
+                    FLAGS.task_index = task_index - 1
+            else:
+                tf_config["task"] = {"index": task_index, "type": task_type}
+                FLAGS.job_name = "ps"
+                FLAGS.task_index = task_index
         else:
             if task_index == 0:
                 tf_config["task"] = {"index": 0, "type": "chief"}
@@ -411,6 +422,9 @@ def set_tfconfig_environ():
         else:
             cluster["chief"] = [cluster["worker"][0]]
             del cluster["worker"][0]
+
+        if len(cluster["ps"]) >= 2 and choose_ps_as_evaluate:
+            del cluster["ps"][0]
 
         tf_config["cluster"] = cluster
         os.environ["TF_CONFIG"] = json.dumps(tf_config)
@@ -452,9 +466,10 @@ def parse_argument():
 
 def main(_):
     print(FLAGS)
+    # file_io.delete_recursively(FLAGS.checkpointDir)
 
     if len(FLAGS.ps_hosts) > 1 and len(FLAGS.worker_hosts) > 1:
-        set_tfconfig_environ()
+        set_tfconfig_environ(FLAGS.choose_ps_as_evaluate)
 
     dfm_params = {
         'feature_size': 12026792,
@@ -518,6 +533,7 @@ def main(_):
 
     total = 2471795  # 16333644
     epoch_steps = total // dfm_params['batch_size']
+    epochs_between_evals = 1
     save_checkpoints_steps = epoch_steps // 4
     max_steps = FLAGS.num_epochs * epoch_steps
 
@@ -539,10 +555,16 @@ def main(_):
     test_input_fn = lambda: OssDataFeeder(test_table).create_dataset(dfm_params['batch_size'], num_epochs=None)
 
     train_spec = tf.estimator.TrainSpec(input_fn=train_input_fn, max_steps=max_steps)
-    eval_spec = tf.estimator.EvalSpec(input_fn=test_input_fn, steps=None)
+    eval_spec = tf.estimator.EvalSpec(input_fn=test_input_fn, steps=None, throttle_secs=300)
 
-    # estimator.train(train_input_fn, steps=100)
+    # for epoch in range(FLAGS.num_epochs):
     tf.estimator.train_and_evaluate(estimator, train_spec, eval_spec)
+
+    # for epoch in range(FLAGS.num_epochs):
+    #     estimator.train(train_input_fn, max_steps=max_steps)
+    #     results = estimator.evaluate(test_input_fn)
+    #     for key in sorted(results):
+    #         print('%s: %s' % (key, results[key]))
 
     # Evaluate accuracy.
     results = estimator.evaluate(input_fn=test_input_fn)
@@ -593,6 +615,8 @@ if __name__ == '__main__':
                         help='Number of train worker.')
     parser.add_argument('--save_checkpoints_steps', type=int, default=100,
                         help='Save checkpoints every this many steps')
+    parser.add_argument('--choose_ps_as_evaluate', type=bool, default=False,
+                        help='whether to choose one of ps server as evaluate')
 
     FLAGS, unparsed = parser.parse_known_args()
     tf.logging.set_verbosity(tf.logging.INFO)
