@@ -13,7 +13,7 @@ from tensorflow.python.summary import summary_iterator
 from tensorflow.python.estimator.exporter import Exporter
 
 
-def _loss_smaller(best_eval_result, current_eval_result):
+def _compare_fn(best_eval_result, current_eval_result, metric_key, is_big_better=False):
     """Compares two evaluation results and returns true if the 2nd one is smaller.
 
     Both evaluation results should have the values for MetricKeys.LOSS, which are
@@ -29,17 +29,32 @@ def _loss_smaller(best_eval_result, current_eval_result):
     Raises:
       ValueError: If input eval result is None or no loss is available.
     """
+
     tf_logging.info("metric keys: {}".format(current_eval_result.keys()))
-    default_key = metric_keys.MetricKeys.LOSS
+    default_key = metric_key
     if not best_eval_result or default_key not in best_eval_result:
         raise ValueError(
-            'best_eval_result cannot be empty or no loss is found in it.')
+            'best_eval_result cannot be empty or no {} is found in it.'.format(default_key))
 
     if not current_eval_result or default_key not in current_eval_result:
         raise ValueError(
-            'current_eval_result cannot be empty or no loss is found in it.')
+            'current_eval_result cannot be empty or no {} is found in it.'.format(default_key))
 
-    return best_eval_result[default_key] > current_eval_result[default_key]
+    tf_logging.info("metric key: {}, best: {}, current: {}".format(default_key,
+                                                                   best_eval_result[default_key],
+                                                                   current_eval_result[default_key]))
+    if is_big_better:
+        return best_eval_result[default_key] < current_eval_result[default_key]
+    else:
+        return best_eval_result[default_key] > current_eval_result[default_key]
+
+
+def loss_smaller(best_eval_result, current_eval_result):
+    return _compare_fn(best_eval_result, current_eval_result, metric_keys.MetricKeys.LOSS, is_big_better=False)
+
+
+def auc_bigger(best_eval_result, current_eval_result):
+    return _compare_fn(best_eval_result, current_eval_result, metric_keys.MetricKeys.AUC, is_big_better=True)
 
 
 def _verify_compare_fn_args(compare_fn):
@@ -130,7 +145,7 @@ class BestExporter(Exporter):
                  name='best_exporter',
                  serving_input_receiver_fn=None,
                  event_file_pattern='eval/*.tfevents.*',
-                 compare_fn=_loss_smaller,
+                 compare_fn=loss_smaller,
                  assets_extra=None,
                  as_text=False,
                  exports_to_keep=5):
