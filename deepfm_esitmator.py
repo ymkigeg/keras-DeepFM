@@ -201,8 +201,12 @@ class DeepFMEstimator:
         y = tf.sigmoid(logits)
 
         if mode == tf.estimator.ModeKeys.PREDICT:
+            export_outputs = {
+                'predict': tf.estimator.export.PredictOutput(y)
+            }
             spec = tf.estimator.EstimatorSpec(mode=mode,
-                                              predictions=y)
+                                              predictions=y,
+                                              export_outputs=export_outputs)
         else:
 
             cross_entropy = tf.losses.sigmoid_cross_entropy(labels, logits=logits)
@@ -555,7 +559,22 @@ def main(_):
     test_input_fn = lambda: OssDataFeeder(test_table).create_dataset(dfm_params['batch_size'], num_epochs=None)
 
     train_spec = tf.estimator.TrainSpec(input_fn=train_input_fn, max_steps=max_steps)
-    eval_spec = tf.estimator.EvalSpec(input_fn=test_input_fn, steps=None, throttle_secs=300)
+    
+    # 这里定义 exporters, 用于导出 bestModel
+    serving_feature_spec = {
+        "feat_index": parsing_ops.FixedLenFeature([dfm_params['field_size']], dtype=tf.int64),
+        "feat_value": parsing_ops.FixedLenFeature([dfm_params['field_size']], dtype=tf.float32),
+    }
+    serving_input_receiver_fn = (
+        tf.estimator.export.build_parsing_serving_input_receiver_fn(
+            serving_feature_spec))
+    exporters = [
+        BestExporter(
+            name="best_exporter",
+            serving_input_receiver_fn=serving_input_receiver_fn,
+            exports_to_keep=5)
+    ]
+    eval_spec = tf.estimator.EvalSpec(input_fn=test_input_fn, steps=None, throttle_secs=300, exporters=exporters)
 
     # for epoch in range(FLAGS.num_epochs):
     tf.estimator.train_and_evaluate(estimator, train_spec, eval_spec)
